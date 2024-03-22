@@ -26,6 +26,22 @@ type Peer struct {
 	state int32
 	srv   *Server
 	buf   []byte
+
+	ErPriv noise.NoisePrivateKey
+	ErPub  noise.NoisePublicKey
+	EiPub  noise.NoisePublicKey
+	SiPub  noise.NoisePublicKey
+	TrRecv noise.NoiseSymmetricKey
+	TrSend noise.NoiseSymmetricKey
+
+	Hash     [blake2s.Size]byte
+	ChainKey [blake2s.Size]byte
+	Key      [chacha20poly1305.KeySize]byte
+	Nonce    [chacha20poly1305.NonceSize]byte
+
+	EncStatic [noise.NoisePublicKeySize + poly1305.TagSize]byte
+	EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte
+	Timestamp tai64n.Timestamp
 }
 
 type Server struct {
@@ -40,26 +56,26 @@ type Server struct {
 	peers map[uint64]*Peer
 	pool  *util.Pool
 
-	ErPriv    noise.NoisePrivateKey
-	ErPub     noise.NoisePublicKey
-	SrPriv    noise.NoisePrivateKey
-	SrPub     noise.NoisePublicKey
-	EiPub     noise.NoisePublicKey
-	EncStatic [noise.NoisePublicKeySize + poly1305.TagSize]byte
-	EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte
-	SiPub     noise.NoisePublicKey
-	Timestamp tai64n.Timestamp
-	TrRecv    noise.NoiseSymmetricKey
-	TrSend    noise.NoiseSymmetricKey
+	ErPriv noise.NoisePrivateKey // peer
+	ErPub  noise.NoisePublicKey  // peer
+	SrPriv noise.NoisePrivateKey
+	SrPub  noise.NoisePublicKey
+	//EiPub     noise.NoisePublicKey // peer
+	//EncStatic [noise.NoisePublicKeySize + poly1305.TagSize]byte // peer
+	//EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte     // peer
+	//SiPub     noise.NoisePublicKey // peer
+	//Timestamp tai64n.Timestamp
+	//TrRecv    noise.NoiseSymmetricKey // peer
+	//TrSend noise.NoiseSymmetricKey // peer
 
 	chanBufSize int
 	fromNet     chan *noise.UdpPacket
 	toNet       chan *noise.UdpPacket
 
-	Hash     [blake2s.Size]byte
-	ChainKey [blake2s.Size]byte
-	Key      [chacha20poly1305.KeySize]byte
-	Nonce    [chacha20poly1305.NonceSize]byte
+	//Hash     [blake2s.Size]byte               // peer
+	//ChainKey [blake2s.Size]byte               // peer
+	//Key      [chacha20poly1305.KeySize]byte   // peer
+	//Nonce    [chacha20poly1305.NonceSize]byte // peer
 
 	pktHandle map[byte](func(*noise.UdpPacket, *noise.Packet))
 }
@@ -171,6 +187,10 @@ func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet) {
 		fmt.Println("服务端已经有该客户端的记录。")
 	}
 
+	// 为peer结构初始化对应的字段。
+	peer.ErPub = srv.ErPub
+	peer.ErPriv = srv.ErPriv
+
 	// 为客户端分配一个隧道地址。
 	cltIP, err := srv.pool.Next()
 	if err != nil {
@@ -184,13 +204,13 @@ func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet) {
 	// 将Payload中的数据反序列化为Server的字段。
 	left := 0
 	right := noise.NoisePublicKeySize
-	copy(srv.EiPub[:], p.Payload[left:right])
+	copy(peer.EiPub[:], p.Payload[left:right])
 	left = right
 	right += noise.NoisePublicKeySize + poly1305.TagSize
-	copy(srv.EncStatic[:], p.Payload[left:right])
+	copy(peer.EncStatic[:], p.Payload[left:right])
 	left = right
 	right += tai64n.TimestampSize + poly1305.TagSize
-	copy(srv.EncTime[:], p.Payload[left:right])
+	copy(peer.EncTime[:], p.Payload[left:right])
 
 	// 消耗接收到的Handshake Initiation并生成用于传输的Handshake Response。
 	peer.srv = srv
@@ -223,56 +243,56 @@ func (peer *Peer) Seq() uint32 {
 func (peer *Peer) responsePayload() []byte {
 	// 密码学处理。
 	srv := peer.srv
-	srv.ChainKey = blake2s.Sum256([]byte(noise.NoiseConstruction))         // h1
-	noise.MixHash(&srv.Hash, &srv.ChainKey, []byte(noise.NoiseIdentifier)) // ck0
+	peer.ChainKey = blake2s.Sum256([]byte(noise.NoiseConstruction))          // h1
+	noise.MixHash(&peer.Hash, &peer.ChainKey, []byte(noise.NoiseIdentifier)) // ck0
 
-	noise.MixHash(&srv.Hash, &srv.Hash, srv.ErPub[:])        // h2 = Hash(h1 || Er_pub)
-	noise.MixHash(&srv.Hash, &srv.Hash, srv.EiPub[:])        // h3 = Hash(h2 || Ei_pub)
-	noise.MixKey(&srv.ChainKey, &srv.ChainKey, srv.EiPub[:]) // ck1 = HKDF1(ck0, Ei_pub)
-	ee := srv.ErPriv.SharedSecret(srv.EiPub)
-	noise.KDF2(&srv.ChainKey, &srv.Key, srv.ChainKey[:], ee[:]) // (ck2, k0) = HKDF2(ck1, DH(ErPriv, ErPub))
+	noise.MixHash(&peer.Hash, &peer.Hash, peer.ErPub[:])        // h2 = Hash(h1 || Er_pub)
+	noise.MixHash(&peer.Hash, &peer.Hash, peer.EiPub[:])        // h3 = Hash(h2 || Ei_pub)
+	noise.MixKey(&peer.ChainKey, &peer.ChainKey, peer.EiPub[:]) // ck1 = HKDF1(ck0, Ei_pub)
+	ee := peer.ErPriv.SharedSecret(peer.EiPub)
+	noise.KDF2(&peer.ChainKey, &peer.Key, peer.ChainKey[:], ee[:]) // (ck2, k0) = HKDF2(ck1, DH(ErPriv, ErPub))
 
 	// 解密出SiPub。
-	aead, err := chacha20poly1305.New(srv.Key[:])
+	aead, err := chacha20poly1305.New(peer.Key[:])
 	if err != nil {
 		fmt.Println("生成EncStatic解密器失败:", err)
 		return nil
 	}
-	_, err = aead.Open(srv.SiPub[:0], srv.Nonce[:], srv.EncStatic[:], srv.Hash[:])
+	_, err = aead.Open(peer.SiPub[:0], peer.Nonce[:], peer.EncStatic[:], peer.Hash[:])
 	if err != nil {
 		fmt.Print("针对EncStatic的解密失败:", err)
 		return nil
 	}
 
 	// 密码学处理。
-	noise.MixHash(&srv.Hash, &srv.Hash, srv.EncStatic[:]) // h4 = Hash(h3 || enc-id)
-	se := srv.ErPriv.SharedSecret(srv.SiPub)
-	noise.KDF2(&srv.ChainKey, &srv.Key, srv.ChainKey[:], se[:]) // (ck3, k1) = HKDF2(ck2, DH(ErPriv, SiPub))
+	noise.MixHash(&peer.Hash, &peer.Hash, peer.EncStatic[:]) // h4 = Hash(h3 || enc-id)
+	se := srv.ErPriv.SharedSecret(peer.SiPub)
+	noise.KDF2(&peer.ChainKey, &peer.Key, peer.ChainKey[:], se[:]) // (ck3, k1) = HKDF2(ck2, DH(ErPriv, SiPub))
 
 	// 解密出Timestamp。
-	aead, err = chacha20poly1305.New(srv.Key[:])
+	aead, err = chacha20poly1305.New(peer.Key[:])
 	if err != nil {
 		fmt.Println("生成Timestamp解密器失败:", err)
 		return nil
 	}
-	_, err = aead.Open(srv.Timestamp[:0], srv.Nonce[:], srv.EncTime[:], srv.Hash[:]) // aead-dec(k1, 0, enc-time, h4)
+	_, err = aead.Open(peer.Timestamp[:0], peer.Nonce[:], peer.EncTime[:], peer.Hash[:]) // aead-dec(k1, 0, enc-time, h4)
 	if err != nil {
 		fmt.Println("针对EncTime的解密失败:", err)
 	}
 
 	// 利用上一步生成的Key对SrPub进行加密，生成EncStatic。
-	aead.Seal(srv.EncStatic[:0], srv.Nonce[:], srv.SrPub[:], srv.Hash[:]) // enc-id = aead-enc(k0, 0, SiPub, h3)
+	aead.Seal(peer.EncStatic[:0], peer.Nonce[:], srv.SrPub[:], peer.Hash[:]) // enc-id = aead-enc(k0, 0, SiPub, h3)
 
 	// 派生出用于加解密的密钥。
-	es := srv.SrPriv.SharedSecret(srv.EiPub)
-	noise.KDF2((*[chacha20poly1305.KeySize]byte)(&srv.TrRecv),
-		(*[chacha20poly1305.KeySize]byte)(&srv.TrSend),
-		srv.ChainKey[:],
+	es := srv.SrPriv.SharedSecret(peer.EiPub)
+	noise.KDF2((*[chacha20poly1305.KeySize]byte)(&peer.TrRecv),
+		(*[chacha20poly1305.KeySize]byte)(&peer.TrSend),
+		peer.ChainKey[:],
 		es[:]) // (TrRecv, TrSend) = HKDF2(ck2, DH(SrPriv, EiPub))
 
 	// 将EncStatic，IP和Mask组装成Payload，IP和Mask分别占4个和1个字节。
 	buf := bytes.NewBuffer(make([]byte, 0, noise.NoisePublicKeySize+poly1305.TagSize+4+1))
-	buf.Write(srv.EncStatic[:])
+	buf.Write(peer.EncStatic[:])
 	buf.Write(peer.ip)
 	buf.WriteByte(byte(peer.mask))
 
