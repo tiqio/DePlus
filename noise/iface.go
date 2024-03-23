@@ -18,7 +18,7 @@ func NewTun(ip string) (iface *water.Interface, err error) {
 		return nil, err
 	}
 
-	out, err := RunCommand(fmt.Sprintf("sudo ip addr add %s/24 dev %s", ip, iface.Name()))
+	out, err := RunCommand(fmt.Sprintf("sudo ip addr add %s dev %s", ip, iface.Name()))
 	if err != nil {
 		fmt.Println("标准输出:", out)
 		fmt.Println("对TUN设备配置地址失败:", err)

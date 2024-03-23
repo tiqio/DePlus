@@ -67,7 +67,7 @@ func main() {
 
 	// 初始化客户端结构体。
 	client := new(Client)
-	client.endIp = "0.0.0.0"
+	client.endIp = "22.22.22.1"
 	client.endHttpPort = 51820
 	client.endUdpPort = 51821
 	_, err := rand.Read(client.sid[:])
@@ -112,7 +112,8 @@ func main() {
 	go client.handleUDP(serverUdpAddr)
 
 	// 处理和TUN设备相关的流量。
-	go client.handleInterface()
+	// 必须放到handleHandshakeAck完成，TUN设备被创建后。
+	//go client.handleInterface()
 
 	termSignal := make(chan os.Signal, 1)
 	signal.Notify(termSignal, os.Interrupt, syscall.SIGTERM)
@@ -142,13 +143,12 @@ func (clt *Client) handleInterface() {
 			return
 		}
 
-		buf := make([]byte, noise.HDR_LEN+n)
-		copy(buf[noise.HDR_LEN:], frame[:n])
 		p := new(noise.Packet)
-		p.Payload = buf[noise.HDR_LEN:]
-		p.Buf = buf
 		p.Flag = noise.FLG_DAT
 		p.Seq = clt.Seq()
+		p.Payload = make([]byte, n)
+		copy(p.Payload, frame[:n])
+
 		clt.toNet <- p
 	}
 }
@@ -196,12 +196,24 @@ func (clt *Client) handleUDP(serverUdpAddr string) {
 			fmt.Println("客户端的UDP数据流异常，读取失败:", err)
 			continue
 		}
-		p, err := noise.UnPack(buf[:n])
-		if err != nil {
-			fmt.Println("客户端解包失败:", err)
+
+		// 反序列化为Packet结构。
+		var p *noise.Packet
+		p, err = noise.UnPack(buf[:n])
+		// 去除从UDP数据流读取的过多的0。
+		p.Payload = bytes.TrimRight(p.Payload, "\x00")
+
+		fmt.Printf("* 接收到从服务端来到的报文[%d]。\n", p.Flag)
+
+		if p.Flag == noise.FLG_DAT {
+			p.Payload = clt.TRecv.Decrypt(p.Payload[:])
+			fmt.Println("数据报文处理中...")
 		}
+
 		if handle_func, ok := clt.pktHandle[p.Flag]; ok {
 			handle_func(udpConn, p)
+		} else {
+			fmt.Println("报文的Flag标志未被注册。")
 		}
 	}
 }
@@ -245,6 +257,9 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 		fmt.Println("配置本地TUN设备的地址:", ip, subnet.Mask)
 		clt.iface, _ = noise.NewTun(ipStr)
 
+		// 处理和TUN设备相关的流量。
+		go clt.handleInterface()
+
 		// 密码学处理。
 		aead, err := chacha20poly1305.New(clt.Key[:])
 		if err != nil {
@@ -271,6 +286,8 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 		}
 		close(clt.handshakeDone)
 	}
+
+	clt.toServer(u, noise.FLG_HSH|noise.FLG_ACK, nil)
 }
 
 func (clt *Client) handleDataPacket(u *net.UDPConn, p *noise.Packet) {

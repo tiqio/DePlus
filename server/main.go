@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 type Peer struct {
@@ -45,6 +46,8 @@ type Peer struct {
 	Timestamp tai64n.Timestamp
 
 	recvBuffer *noise.PacketBuffer
+
+	hsDone chan struct{}
 }
 
 type Server struct {
@@ -84,7 +87,7 @@ type Server struct {
 	//Key      [chacha20poly1305.KeySize]byte   // peer
 	//Nonce    [chacha20poly1305.NonceSize]byte // peer
 
-	pktHandle map[byte](func(*noise.UdpPacket, *noise.Packet))
+	pktHandle map[byte](func(*noise.UdpPacket, *noise.Packet, *Peer))
 }
 
 func (srv Server) handler(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +102,7 @@ func main() {
 
 	// 初始化服务端结构体。
 	server := new(Server)
-	server.ip = "0.0.0.0"
+	server.ip = "22.22.22.1"
 	server.httpPort = 51820
 	server.udpPort = 51821
 	server.tunnelIP = "10.10.10.1/24"
@@ -142,8 +145,22 @@ func main() {
 	serverUdpAddr := fmt.Sprintf("%s:%d", server.ip, server.udpPort)
 	go server.handleUDP(serverUdpAddr)
 
-	// 处理客户端的数据结构，即UdpPacket。
-	go server.forwardFrames()
+	// 将从TUN设备获得的数据包处理成客户端的数据结构，即将Packet包装为UdpPacket。
+	go func() {
+		for {
+			p := <-server.fromIface
+			dest := waterutil.IPv4Destination(p.Payload).To4()
+			sid := noise.IP4_uint64(dest)
+
+			if peer, found := server.peers[sid]; found {
+				p.Seq = peer.Seq()
+				up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
+				server.toNet <- up
+			} else {
+				fmt.Println("没有找到目标地址相对应的客户端。")
+			}
+		}
+	}()
 
 	// 处理和TUN设备相关的流量。
 	go server.handleInterface()
@@ -177,50 +194,19 @@ func (srv *Server) handleInterface() {
 				return
 			}
 
-			buf := make([]byte, noise.HDR_LEN+n)
-			copy(buf[noise.HDR_LEN:], frame[:n])
 			p := new(noise.Packet)
-			p.Payload = buf[noise.HDR_LEN:]
-			p.Buf = buf
 			p.Flag = noise.FLG_DAT
 			// 和客户端相比，Seq需要在查找到peer后赋值。
+			p.Payload = make([]byte, n)
+			copy(p.Payload, frame[:n])
+
 			srv.fromIface <- p
 		}
 	}()
 
 }
 
-func (srv *Server) forwardFrames() {
-	// 处理fromIface传入的Packet数据包。
-	for {
-		p := <-srv.fromIface
-		dest := waterutil.IPv4Destination(p.Payload).To4()
-		sid := noise.IP4_uint64(dest)
-
-		if peer, found := srv.peers[sid]; found {
-			p.Seq = peer.Seq()
-			up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
-			srv.toNet <- up
-		} else {
-			fmt.Println("没有找到目标地址相对应的客户端。")
-			return
-		}
-	}
-}
-
-func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet) {
-	sid := uint64(p.Sid)
-	sid = (sid << 32) & uint64(0xFFFFFFFF00000000)
-	fmt.Printf("接收到从客户端来到的握手报文 addr: %v, sid: %d\n", up.Addr, sid)
-
-	peer, ok := srv.peers[sid]
-	if !ok {
-		peer = srv.newPeer(sid, up.Addr)
-		srv.peers[sid] = peer
-	} else {
-		fmt.Println("服务端已经有该客户端的记录。")
-	}
-
+func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet, peer *Peer) {
 	// 为peer结构初始化对应的字段。
 	peer.ErPub = srv.ErPub
 	peer.ErPriv = srv.ErPriv
@@ -251,12 +237,28 @@ func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet) {
 	peer.buf = peer.responsePayload()
 
 	// 基于隧道地址注册peer。
-	sid = noise.IP4_uint64(peer.ip)
+	sid := noise.IP4_uint64(peer.ip)
 	srv.peers[sid] = peer
 
 	// 更新当前peer的状态为握手状态，并向对应客户端发送响应报文。
 	atomic.StoreInt32(&peer.state, noise.STAT_HANDSHAKE)
 	peer.toClient(noise.FLG_HSH | noise.FLG_ACK)
+
+	// 等待确认报文。
+	peer.hsDone = make(chan struct{})
+	go func() {
+		for i := 0; i < 5; i++ {
+			select {
+			case <-peer.hsDone:
+				peer.state = noise.STAT_WORKING
+				fmt.Printf("Sid为[%d]，Addr为[%v]的Peer的握手成功完成。\n", peer.sid, peer.addr)
+				return
+			case <-time.After(2 * time.Second):
+				fmt.Println("等待客户端握手的计时器超时。")
+				peer.toClient(noise.FLG_HSH | noise.FLG_ACK)
+			}
+		}
+	}()
 }
 
 func (peer *Peer) toClient(flag byte) {
@@ -362,9 +364,10 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 	fmt.Println("等待客户端连接...")
 
 	// 注册和Flag相对应的处理函数。
-	srv.pktHandle = map[byte](func(*noise.UdpPacket, *noise.Packet)){
-		noise.FLG_HSH: srv.handleHandshake,
-		noise.FLG_DAT: srv.handleDataPacket,
+	srv.pktHandle = map[byte](func(*noise.UdpPacket, *noise.Packet, *Peer)){
+		noise.FLG_HSH:                 srv.handleHandshake,
+		noise.FLG_HSH | noise.FLG_ACK: srv.handleHandshakeAck,
+		noise.FLG_DAT:                 srv.handleDataPacket,
 	}
 
 	// 将toNet队列中的UdpPacket发送到UDP数据流的对端。
@@ -377,37 +380,58 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 
 	// 从UDP数据流中读取数据包并调用相关的处理函数。
 	for {
-		var plen int
+		var n int
 		up := new(noise.UdpPacket)
 		buf := make([]byte, noise.UDP_BUFFER)
-		plen, up.Addr, err = udpConn.ReadFromUDP(buf)
+		n, up.Addr, err = udpConn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("客户端从UDP数据流中读取失败:", err)
 			return
 		}
 
+		// 反序列化为Packet结构。
 		var p *noise.Packet
-		p, err = noise.UnPack(buf[:plen])
-		if err != nil {
-			fmt.Println("针对UdpPacket的解密失败。")
-			return
+		p, err = noise.UnPack(buf[:n])
+		// 去除从UDP数据流读取的过多的0。
+		p.Payload = bytes.TrimRight(p.Payload, "\x00")
+
+		// 会在这里注册对端的Peer结构。
+		sid := uint64(p.Sid)
+		sid = (sid << 32) & uint64(0xFFFFFFFF00000000)
+		fmt.Printf("* 接收到从客户端来到的报文[%d] addr: %v, sid: %d。\n", p.Flag, up.Addr, sid)
+
+		peer, ok := srv.peers[sid]
+		if !ok {
+			peer = srv.newPeer(sid, up.Addr)
+			srv.peers[sid] = peer
+		} else {
+			fmt.Println("服务端已经有该客户端的记录。")
 		}
 
-		fmt.Printf("新的UDP报文[%v]来自: %v\n", p.Flag, up.Addr)
+		// 使用Peer结构对数据包的Payload进行解密。
+		if p.Flag == noise.FLG_DAT {
+			p.Payload = peer.TRecv.Decrypt(p.Payload)
+			fmt.Println("数据报文处理中...")
+		}
+
 		if handle_func, ok := srv.pktHandle[p.Flag]; ok {
-			handle_func(up, p)
+			handle_func(up, p, peer)
 		} else {
 			fmt.Println("报文的Flag标志未被注册。")
-			return
 		}
 	}
 }
 
-func (srv *Server) handleDataPacket(up *noise.UdpPacket, p *noise.Packet) {
-	sid := uint64(p.Sid)
-	sid = (sid << 32) & uint64(0xFFFFFFFF00000000)
-
-	if peer, ok := srv.peers[sid]; ok && peer.state == noise.STAT_WORKING {
+func (srv *Server) handleDataPacket(up *noise.UdpPacket, p *noise.Packet, peer *Peer) {
+	if peer.state == noise.STAT_WORKING {
 		peer.recvBuffer.Push(p)
+	}
+}
+
+func (srv *Server) handleHandshakeAck(up *noise.UdpPacket, p *noise.Packet, peer *Peer) {
+	if ok := atomic.CompareAndSwapInt32(&peer.state, noise.STAT_HANDSHAKE, noise.STAT_WORKING); ok {
+		peer.hsDone <- struct{}{}
+	} else {
+		fmt.Println("当前Peer结构的状态不合法。")
 	}
 }
