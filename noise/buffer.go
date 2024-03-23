@@ -1,8 +1,7 @@
-package util
+package noise
 
 import (
 	"fmt"
-	"github.com/tiqio/DePlus/noise"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,11 +11,11 @@ type PacketBuffer struct {
 	buf       *bufferList
 	rate      int32
 	mutex     sync.Mutex
-	flushChan chan *noise.Packet
+	flushChan chan *Packet
 	newPack   chan struct{}
 }
 
-func NewPacketBuffer(flushChan chan *noise.Packet) *PacketBuffer {
+func NewPacketBuffer(flushChan chan *Packet) *PacketBuffer {
 	hb := new(PacketBuffer)
 	hb.buf = newBufferList()
 	hb.flushChan = flushChan
@@ -32,20 +31,20 @@ func NewPacketBuffer(flushChan chan *noise.Packet) *PacketBuffer {
 	return hb
 }
 
-func (hb *PacketBuffer) Push(p *noise.Packet) {
+func (hb *PacketBuffer) Push(p *Packet) {
 	atomic.AddInt32(&hb.rate, 1)
 	hb.buf.Push(int64(p.Seq), p)
 	hb.newPack <- struct{}{}
 }
 
-func (hb *PacketBuffer) Pop() *noise.Packet {
+func (hb *PacketBuffer) Pop() *Packet {
 	<-hb.newPack
 	r := int(hb.rate & 0x10)
 	if hb.buf.count < 8+r {
 		time.Sleep(time.Duration(r*20+50) * time.Microsecond)
 		hb.rate = hb.rate >> 1
 	}
-	p := hb.buf.Pop().(*noise.Packet)
+	p := hb.buf.Pop().(*Packet)
 	return p
 }
 

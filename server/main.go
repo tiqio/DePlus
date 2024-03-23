@@ -7,7 +7,6 @@ import (
 	"github.com/songgao/water/waterutil"
 	"github.com/tiqio/DePlus/noise"
 	"github.com/tiqio/DePlus/tai64n"
-	"github.com/tiqio/DePlus/util"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
@@ -45,7 +44,7 @@ type Peer struct {
 	EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte
 	Timestamp tai64n.Timestamp
 
-	recvBuffer *util.PacketBuffer
+	recvBuffer *noise.PacketBuffer
 }
 
 type Server struct {
@@ -61,7 +60,7 @@ type Server struct {
 
 	// 键是会话ID（前32字节）或者隧道IP（后32字节），值是Peer结构体，对应着某个客户端。
 	peers map[uint64]*Peer
-	pool  *util.Pool
+	pool  *noise.Pool
 
 	ErPriv noise.NoisePrivateKey // peer
 	ErPub  noise.NoisePublicKey  // peer
@@ -114,7 +113,7 @@ func main() {
 	server.fromIface = make(chan *noise.Packet, server.chanBufSize)
 
 	server.peers = make(map[uint64]*Peer)
-	server.pool = new(util.Pool)
+	server.pool = new(noise.Pool)
 	ip, subnet, err := net.ParseCIDR(server.tunnelIP)
 	if err != nil {
 		fmt.Println("配置的隧道地址格式不对:", err)
@@ -124,7 +123,7 @@ func main() {
 
 	// 配置本地TUN设备的地址。
 	fmt.Println("配置本地TUN设备的地址:", ip, " & ", subnet.Mask)
-	server.iface, _ = util.NewTun(server.tunnelIP)
+	server.iface, _ = noise.NewTun(server.tunnelIP)
 
 	// 利用生成的ErPub开启HTTP服务。
 	http.HandleFunc("/", server.handler)
@@ -196,7 +195,7 @@ func (srv *Server) forwardFrames() {
 	for {
 		p := <-srv.fromIface
 		dest := waterutil.IPv4Destination(p.Payload).To4()
-		sid := util.IP4_uint64(dest)
+		sid := noise.IP4_uint64(dest)
 
 		if peer, found := srv.peers[sid]; found {
 			p.Seq = peer.Seq()
@@ -252,7 +251,7 @@ func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet) {
 	peer.buf = peer.responsePayload()
 
 	// 基于隧道地址注册peer。
-	sid = util.IP4_uint64(peer.ip)
+	sid = noise.IP4_uint64(peer.ip)
 	srv.peers[sid] = peer
 
 	// 更新当前peer的状态为握手状态，并向对应客户端发送响应报文。
@@ -340,7 +339,7 @@ func (srv *Server) newPeer(sid uint64, addr *net.UDPAddr) *Peer {
 	peer.addr = addr
 	peer.seq = 0
 	peer.state = noise.STAT_INIT
-	peer.recvBuffer = util.NewPacketBuffer(srv.toIface)
+	peer.recvBuffer = noise.NewPacketBuffer(srv.toIface)
 
 	return peer
 }

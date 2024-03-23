@@ -7,7 +7,6 @@ import (
 	"github.com/songgao/water"
 	"github.com/tiqio/DePlus/noise"
 	"github.com/tiqio/DePlus/tai64n"
-	"github.com/tiqio/DePlus/util"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
@@ -50,7 +49,7 @@ type Client struct {
 
 	chanBufSize int
 	toIface     chan *noise.Packet
-	recvBuffer  *util.PacketBuffer
+	recvBuffer  *noise.PacketBuffer
 	toNet       chan *noise.Packet
 
 	Hash     [blake2s.Size]byte
@@ -82,7 +81,7 @@ func main() {
 
 	client.chanBufSize = 128
 	client.toIface = make(chan *noise.Packet, client.chanBufSize)
-	client.recvBuffer = util.NewPacketBuffer(client.toIface)
+	client.recvBuffer = noise.NewPacketBuffer(client.toIface)
 	client.toNet = make(chan *noise.Packet, client.chanBufSize)
 
 	client.state = noise.STAT_INIT
@@ -244,7 +243,7 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 
 		// 配置TUN设备地址。
 		fmt.Println("配置本地TUN设备的地址:", ip, subnet.Mask)
-		clt.iface, _ = util.NewTun(ipStr)
+		clt.iface, _ = noise.NewTun(ipStr)
 
 		// 密码学处理。
 		aead, err := chacha20poly1305.New(clt.Key[:])
