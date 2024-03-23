@@ -15,6 +15,7 @@ type Header struct {
 type Packet struct {
 	Header
 	Payload []byte
+	Buf     []byte
 }
 
 type UdpPacket struct {
@@ -32,15 +33,21 @@ func (p *Packet) SetPayload(payload []byte) {
 	p.Payload = payload
 }
 
-func (p *Packet) Pack() []byte {
+func (p *Packet) Pack(TSend NoiseSymmetricKey) []byte {
 	var buf *bytes.Buffer
+	buf = bytes.NewBuffer(make([]byte, 0, p.Size()))
+	binary.Write(buf, binary.BigEndian, p.Header)
+	buf.Write(p.Payload)
+
 	switch p.Flag {
 	case FLG_HSH | FLG_ACK, FLG_HSH:
-		buf = bytes.NewBuffer(make([]byte, 0, p.Size()))
-		binary.Write(buf, binary.BigEndian, p.Header)
-		buf.Write(p.Payload)
+		return buf.Bytes()
+	case FLG_DAT:
+		// 需要利用TiSend或着TrSend对数据流进行加密。
+		return TSend.Encrypt(buf.Bytes())
+	default:
+		return nil
 	}
-	return buf.Bytes()
 }
 
 func (p *Packet) Size() int {

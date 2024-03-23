@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"fmt"
+	"github.com/tiqio/DePlus/util"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -115,4 +116,12 @@ func setZero(arr []byte) {
 	for i := range arr {
 		arr[i] = 0
 	}
+}
+
+func (TSend *NoiseSymmetricKey) Encrypt(orig []byte) []byte {
+	return util.AesEncrypt(orig, TSend[:])
+}
+
+func (TRecv *NoiseSymmetricKey) Decrypt(crypted []byte) []byte {
+	return util.AesDecrypt(crypted, TRecv[:])
 }

@@ -1,11 +1,13 @@
 package main
 
 import (
-	"DePlus/noise"
-	"DePlus/tai64n"
-	"DePlus/util"
 	"bytes"
 	"fmt"
+	"github.com/songgao/water"
+	"github.com/songgao/water/waterutil"
+	"github.com/tiqio/DePlus/noise"
+	"github.com/tiqio/DePlus/tai64n"
+	"github.com/tiqio/DePlus/util"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
@@ -31,8 +33,8 @@ type Peer struct {
 	ErPub  noise.NoisePublicKey
 	EiPub  noise.NoisePublicKey
 	SiPub  noise.NoisePublicKey
-	TrRecv noise.NoiseSymmetricKey
-	TrSend noise.NoiseSymmetricKey
+	TRecv  noise.NoiseSymmetricKey
+	TSend  noise.NoiseSymmetricKey
 
 	Hash     [blake2s.Size]byte
 	ChainKey [blake2s.Size]byte
@@ -42,6 +44,8 @@ type Peer struct {
 	EncStatic [noise.NoisePublicKeySize + poly1305.TagSize]byte
 	EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte
 	Timestamp tai64n.Timestamp
+
+	recvBuffer *util.PacketBuffer
 }
 
 type Server struct {
@@ -50,7 +54,10 @@ type Server struct {
 	// 端口
 	httpPort int
 	udpPort  int
+	// 隧道地址
 	tunnelIP string
+	// TUN设备接口
+	iface *water.Interface
 
 	// 键是会话ID（前32字节）或者隧道IP（后32字节），值是Peer结构体，对应着某个客户端。
 	peers map[uint64]*Peer
@@ -65,12 +72,13 @@ type Server struct {
 	//EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte     // peer
 	//SiPub     noise.NoisePublicKey // peer
 	//Timestamp tai64n.Timestamp
-	//TrRecv    noise.NoiseSymmetricKey // peer
-	//TrSend noise.NoiseSymmetricKey // peer
+	//TRecv    noise.NoiseSymmetricKey // peer
+	//TSend noise.NoiseSymmetricKey // peer
 
 	chanBufSize int
-	fromNet     chan *noise.UdpPacket
 	toNet       chan *noise.UdpPacket
+	toIface     chan *noise.Packet
+	fromIface   chan *noise.Packet
 
 	//Hash     [blake2s.Size]byte               // peer
 	//ChainKey [blake2s.Size]byte               // peer
@@ -101,8 +109,9 @@ func main() {
 	server.SrPriv, server.SrPub = noise.NewKeyPair()
 
 	server.chanBufSize = 2048
-	server.fromNet = make(chan *noise.UdpPacket, server.chanBufSize)
 	server.toNet = make(chan *noise.UdpPacket, server.chanBufSize)
+	server.toIface = make(chan *noise.Packet, server.chanBufSize)
+	server.fromIface = make(chan *noise.Packet, server.chanBufSize)
 
 	server.peers = make(map[uint64]*Peer)
 	server.pool = new(util.Pool)
@@ -114,7 +123,8 @@ func main() {
 	server.pool.Subnet = subnet
 
 	// 配置本地TUN设备的地址。
-	fmt.Println("待写:配置本地TUN设备的地址:", ip, " & ", subnet.Mask)
+	fmt.Println("配置本地TUN设备的地址:", ip, " & ", subnet.Mask)
+	server.iface, _ = util.NewTun(server.tunnelIP)
 
 	// 利用生成的ErPub开启HTTP服务。
 	http.HandleFunc("/", server.handler)
@@ -136,41 +146,66 @@ func main() {
 	// 处理客户端的数据结构，即UdpPacket。
 	go server.forwardFrames()
 
+	// 处理和TUN设备相关的流量。
+	go server.handleInterface()
+
 	termSignal := make(chan os.Signal, 1)
 	signal.Notify(termSignal, os.Interrupt, syscall.SIGTERM)
 	<-termSignal
 	fmt.Println("服务端关闭。")
 }
 
-func (srv *Server) forwardFrames() {
-
-	// 注册和Flag相对应的处理函数。
-	srv.pktHandle = map[byte](func(*noise.UdpPacket, *noise.Packet)){
-		noise.FLG_HSH: srv.handleHandshake,
-	}
-
-	for {
-		select {
-		case up := <-srv.fromNet:
-			srv.handlePacket(up)
+func (srv *Server) handleInterface() {
+	// 从toIface中获取数据包并写入TUN设备。
+	go func() {
+		for {
+			p := <-srv.toIface
+			_, err := srv.iface.Write(p.Payload)
+			if err != nil {
+				fmt.Println("写入TUN设备失败:", err)
+				return
+			}
 		}
-	}
+	}()
+
+	// 从TUN设备中读取数据包并写入toNet。
+	frame := make([]byte, noise.UDP_BUFFER-noise.HDR_LEN)
+	go func() {
+		for {
+			n, err := srv.iface.Read(frame)
+			if err != nil {
+				fmt.Println("从TUN设备中读取失败:", err)
+				return
+			}
+
+			buf := make([]byte, noise.HDR_LEN+n)
+			copy(buf[noise.HDR_LEN:], frame[:n])
+			p := new(noise.Packet)
+			p.Payload = buf[noise.HDR_LEN:]
+			p.Buf = buf
+			p.Flag = noise.FLG_DAT
+			// 和客户端相比，Seq需要在查找到peer后赋值。
+			srv.fromIface <- p
+		}
+	}()
 
 }
 
-func (srv *Server) handlePacket(up *noise.UdpPacket) {
-	p, err := noise.UnPack(up.Data)
-	if err == nil {
-		fmt.Printf("新的UDP报文[%v]来自: %v\n", p.Flag, up.Addr)
-		if handle_func, ok := srv.pktHandle[p.Flag]; ok {
-			handle_func(up, p)
+func (srv *Server) forwardFrames() {
+	// 处理fromIface传入的Packet数据包。
+	for {
+		p := <-srv.fromIface
+		dest := waterutil.IPv4Destination(p.Payload).To4()
+		sid := util.IP4_uint64(dest)
+
+		if peer, found := srv.peers[sid]; found {
+			p.Seq = peer.Seq()
+			up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
+			srv.toNet <- up
 		} else {
-			fmt.Println("报文的Flag标志未被注册。")
+			fmt.Println("没有找到目标地址相对应的客户端。")
 			return
 		}
-	} else {
-		fmt.Println("针对UdpPacket的解密失败。")
-		return
 	}
 }
 
@@ -217,8 +252,8 @@ func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet) {
 	peer.buf = peer.responsePayload()
 
 	// 基于隧道地址注册peer。
-	key := util.IP4_uint64(peer.ip)
-	srv.peers[key] = peer
+	sid = util.IP4_uint64(peer.ip)
+	srv.peers[sid] = peer
 
 	// 更新当前peer的状态为握手状态，并向对应客户端发送响应报文。
 	atomic.StoreInt32(&peer.state, noise.STAT_HANDSHAKE)
@@ -232,7 +267,7 @@ func (peer *Peer) toClient(flag byte) {
 	p.Payload = peer.buf
 
 	// 封装为UdpPacket，之后传入toNet队列中进行发送。
-	up := &noise.UdpPacket{peer.addr, p.Pack()}
+	up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
 	peer.srv.toNet <- up
 }
 
@@ -285,10 +320,10 @@ func (peer *Peer) responsePayload() []byte {
 
 	// 派生出用于加解密的密钥。
 	es := srv.SrPriv.SharedSecret(peer.EiPub)
-	noise.KDF2((*[chacha20poly1305.KeySize]byte)(&peer.TrRecv),
-		(*[chacha20poly1305.KeySize]byte)(&peer.TrSend),
+	noise.KDF2((*[chacha20poly1305.KeySize]byte)(&peer.TRecv),
+		(*[chacha20poly1305.KeySize]byte)(&peer.TSend),
 		peer.ChainKey[:],
-		es[:]) // (TrRecv, TrSend) = HKDF2(ck2, DH(SrPriv, EiPub))
+		es[:]) // (TRecv, TSend) = HKDF2(ck2, DH(SrPriv, EiPub))
 
 	// 将EncStatic，IP和Mask组装成Payload，IP和Mask分别占4个和1个字节。
 	buf := bytes.NewBuffer(make([]byte, 0, noise.NoisePublicKeySize+poly1305.TagSize+4+1))
@@ -305,17 +340,20 @@ func (srv *Server) newPeer(sid uint64, addr *net.UDPAddr) *Peer {
 	peer.addr = addr
 	peer.seq = 0
 	peer.state = noise.STAT_INIT
+	peer.recvBuffer = util.NewPacketBuffer(srv.toIface)
 
 	return peer
 }
 
 func (srv *Server) handleUDP(serverUdpAddr string) {
+	// 构造UDP数据流并处理连接。
 	udpAddr, err := net.ResolveUDPAddr("udp", serverUdpAddr)
 	if err != nil {
 		fmt.Println("解析UDP地址失败:", err)
 		return
 	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
+	var udpConn *net.UDPConn
+	udpConn, err = net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		fmt.Println("创建UDP监听器失败:", err)
 		return
@@ -323,6 +361,12 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 	defer udpConn.Close()
 	fmt.Println("开启UDP服务，服务地址:", serverUdpAddr)
 	fmt.Println("等待客户端连接...")
+
+	// 注册和Flag相对应的处理函数。
+	srv.pktHandle = map[byte](func(*noise.UdpPacket, *noise.Packet)){
+		noise.FLG_HSH: srv.handleHandshake,
+		noise.FLG_DAT: srv.handleDataPacket,
+	}
 
 	// 将toNet队列中的UdpPacket发送到UDP数据流的对端。
 	go func() {
@@ -332,19 +376,39 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 		}
 	}()
 
-	// 从UDP数据流中读取数据并传入fromNet队列。
+	// 从UDP数据流中读取数据包并调用相关的处理函数。
 	for {
 		var plen int
 		up := new(noise.UdpPacket)
 		buf := make([]byte, noise.UDP_BUFFER)
 		plen, up.Addr, err = udpConn.ReadFromUDP(buf)
-
-		up.Data = buf[:plen]
 		if err != nil {
-			fmt.Println("客户端接收握手信息失败:", err)
+			fmt.Println("客户端从UDP数据流中读取失败:", err)
 			return
 		}
 
-		srv.fromNet <- up
+		var p *noise.Packet
+		p, err = noise.UnPack(buf[:plen])
+		if err != nil {
+			fmt.Println("针对UdpPacket的解密失败。")
+			return
+		}
+
+		fmt.Printf("新的UDP报文[%v]来自: %v\n", p.Flag, up.Addr)
+		if handle_func, ok := srv.pktHandle[p.Flag]; ok {
+			handle_func(up, p)
+		} else {
+			fmt.Println("报文的Flag标志未被注册。")
+			return
+		}
+	}
+}
+
+func (srv *Server) handleDataPacket(up *noise.UdpPacket, p *noise.Packet) {
+	sid := uint64(p.Sid)
+	sid = (sid << 32) & uint64(0xFFFFFFFF00000000)
+
+	if peer, ok := srv.peers[sid]; ok && peer.state == noise.STAT_WORKING {
+		peer.recvBuffer.Push(p)
 	}
 }

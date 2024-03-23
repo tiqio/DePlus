@@ -1,4 +1,4 @@
-module DePlus
+module github.com/tiqio/DePlus
 
 go 1.22
 

@@ -1,12 +1,13 @@
 package main
 
 import (
-	"DePlus/noise"
-	"DePlus/tai64n"
 	"bytes"
 	"crypto/rand"
 	"fmt"
 	"github.com/songgao/water"
+	"github.com/tiqio/DePlus/noise"
+	"github.com/tiqio/DePlus/tai64n"
+	"github.com/tiqio/DePlus/util"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
@@ -44,8 +45,13 @@ type Client struct {
 	EncStatic [noise.NoisePublicKeySize + poly1305.TagSize]byte
 	EncTime   [tai64n.TimestampSize + poly1305.TagSize]byte
 	SrPub     noise.NoisePublicKey
-	TiSend    noise.NoiseSymmetricKey
-	TiRecv    noise.NoiseSymmetricKey
+	TSend     noise.NoiseSymmetricKey // TiSend
+	TRecv     noise.NoiseSymmetricKey // TiRecv
+
+	chanBufSize int
+	toIface     chan *noise.Packet
+	recvBuffer  *util.PacketBuffer
+	toNet       chan *noise.Packet
 
 	Hash     [blake2s.Size]byte
 	ChainKey [blake2s.Size]byte
@@ -74,6 +80,11 @@ func main() {
 	client.EiPriv, client.EiPub = noise.NewKeyPair()
 	client.SiPriv, client.SiPub = noise.NewKeyPair()
 
+	client.chanBufSize = 128
+	client.toIface = make(chan *noise.Packet, client.chanBufSize)
+	client.recvBuffer = util.NewPacketBuffer(client.toIface)
+	client.toNet = make(chan *noise.Packet, client.chanBufSize)
+
 	client.state = noise.STAT_INIT
 	client.handshakeDone = make(chan struct{})
 
@@ -97,12 +108,50 @@ func main() {
 	// 处理和服务端对接的UDP数据流。
 	serverUdpAddr := fmt.Sprintf("%s:%d", client.endIp, client.endUdpPort)
 	fmt.Printf("正在向%s发起UDP连接...\n", serverUdpAddr)
+
+	// 处理与服务端对接的UDP数据流。
 	go client.handleUDP(serverUdpAddr)
+
+	// 处理和TUN设备相关的流量。
+	go client.handleInterface()
 
 	termSignal := make(chan os.Signal, 1)
 	signal.Notify(termSignal, os.Interrupt, syscall.SIGTERM)
 	<-termSignal
 	fmt.Println("客户端关闭。")
+}
+
+func (clt *Client) handleInterface() {
+	// 从toIface中获取数据包并写入TUN设备。
+	go func() {
+		for {
+			p := <-clt.toIface
+			_, err := clt.iface.Write(p.Payload)
+			if err != nil {
+				fmt.Println("写入TUN设备失败:", err)
+				return
+			}
+		}
+	}()
+
+	// 从TUN设备中读取数据包并写入toNet。
+	frame := make([]byte, noise.UDP_BUFFER-noise.HDR_LEN)
+	for {
+		n, err := clt.iface.Read(frame)
+		if err != nil {
+			fmt.Println("从TUN设备中读取失败:", err)
+			return
+		}
+
+		buf := make([]byte, noise.HDR_LEN+n)
+		copy(buf[noise.HDR_LEN:], frame[:n])
+		p := new(noise.Packet)
+		p.Payload = buf[noise.HDR_LEN:]
+		p.Buf = buf
+		p.Flag = noise.FLG_DAT
+		p.Seq = clt.Seq()
+		clt.toNet <- p
+	}
 }
 
 func (clt *Client) handleUDP(serverUdpAddr string) {
@@ -112,7 +161,7 @@ func (clt *Client) handleUDP(serverUdpAddr string) {
 	// 注册和Flag相对应的处理函数。
 	clt.pktHandle = map[byte](func(*net.UDPConn, *noise.Packet)){
 		noise.FLG_HSH | noise.FLG_ACK: clt.handleHandshakeAck,
-		noise.FLG_HSH | noise.FLG_FIN: clt.handleHandshakeError,
+		noise.FLG_DAT:                 clt.handleDataPacket,
 	}
 
 	// 用于发送握手报文，在收到handshakeAck报文后通过handshakeDone通知，否则在5秒左右超时重传。
@@ -128,6 +177,15 @@ func (clt *Client) handleUDP(serverUdpAddr string) {
 			case <-time.After(5 * time.Second):
 				fmt.Println("握手报文超时重传...")
 			}
+		}
+	}()
+
+	// 将从TUN设备来的数据包封装为报文并传送到UDP数据流上。
+	go func() {
+		for {
+			p := <-clt.toNet
+			p.SetSid(clt.sid)
+			udpConn.Write(p.Pack(clt.TSend))
 		}
 	}()
 
@@ -147,7 +205,6 @@ func (clt *Client) handleUDP(serverUdpAddr string) {
 			handle_func(udpConn, p)
 		}
 	}
-
 }
 
 func (clt *Client) handshake(u *net.UDPConn) {
@@ -165,7 +222,7 @@ func (clt *Client) toServer(u *net.UDPConn, flag byte, payload []byte) {
 	p.Seq = clt.Seq()
 	p.SetSid(clt.sid)
 	p.SetPayload(payload)
-	u.Write(p.Pack())
+	u.Write(p.Pack(clt.TSend))
 }
 
 func (clt *Client) Seq() uint32 {
@@ -186,7 +243,8 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 		ip, subnet, _ := net.ParseCIDR(ipStr)
 
 		// 配置TUN设备地址。
-		fmt.Println("待写:配置本地TUN设备的地址:", ip, subnet.Mask)
+		fmt.Println("配置本地TUN设备的地址:", ip, subnet.Mask)
+		clt.iface, _ = util.NewTun(ipStr)
 
 		// 密码学处理。
 		aead, err := chacha20poly1305.New(clt.Key[:])
@@ -201,10 +259,10 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 
 		// 派生出用于加解密的密钥。
 		es := clt.EiPriv.SharedSecret(clt.SrPub)
-		noise.KDF2((*[chacha20poly1305.KeySize]byte)(&clt.TiSend),
-			(*[chacha20poly1305.KeySize]byte)(&clt.TiRecv),
+		noise.KDF2((*[chacha20poly1305.KeySize]byte)(&clt.TSend),
+			(*[chacha20poly1305.KeySize]byte)(&clt.TRecv),
 			clt.ChainKey[:],
-			es[:]) // (TiSend, TiRecv) = HKDF2(ck2, DH(EiPriv, SrPub))
+			es[:]) // (TSend, TRecv) = HKDF2(ck2, DH(EiPriv, SrPub))
 
 		// 改变当前的握手状态。
 		res := atomic.CompareAndSwapInt32(&clt.state, noise.STAT_HANDSHAKE, noise.STAT_WORKING)
@@ -216,8 +274,8 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 	}
 }
 
-func (clt *Client) handleHandshakeError(u *net.UDPConn, p *noise.Packet) {
-
+func (clt *Client) handleDataPacket(u *net.UDPConn, p *noise.Packet) {
+	clt.recvBuffer.Push(p)
 }
 
 // 生成用于握手的Payload。
