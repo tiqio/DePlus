@@ -89,9 +89,9 @@ Noise Protocol Framework：http://noise.protocol.org/noise.pdf
 
 ### 协程组织
 
-TUN设备的[写入]和[读取]同属协程handleInterface，在客户端和服务端均有实现。
-UDP数据流的[发送]和[接收处理]同属协程handleUDP，在客户端和服务端均有实现。
-[查找对端]属于协程forwardFrames，仅在服务端实现。
+- TUN设备的[写入]和[读取]同属协程handleInterface，在客户端和服务端均有实现。
+- UDP数据流的[发送]和[接收处理]同属协程handleUDP，在客户端和服务端均有实现。
+- [查找对端]属于协程forwardFrames，仅在服务端实现。
 
 ![manage.png](static%2Fmanage.png)
 
