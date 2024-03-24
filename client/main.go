@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"flag"
 	"fmt"
 	"github.com/songgao/water"
 	"github.com/tiqio/DePlus/noise"
@@ -67,15 +68,31 @@ type Client struct {
 func main() {
 	fmt.Println("Initiator...")
 
+	// 解析配置文件。
+	var cfgFile string
+	flag.StringVar(&cfgFile, "config", "", "configFile")
+	flag.Parse()
+
+	if cfgFile == "" {
+		cfgFile = flag.Arg(0)
+	}
+
+	cfg, err := noise.ParseConfig(cfgFile)
+	clientConfig, ok := cfg.(noise.ClientConfig)
+	if err != nil || !ok {
+		fmt.Println("客户端配置文件读取出错。")
+		return
+	}
+
 	// 初始化客户端结构体。
 	client := new(Client)
-	client.endIp = "22.22.22.1"
-	client.endHttpPort = 51820
-	client.endUdpPort = 51821
-	client.subnet = "192.168.1.0/24"
-	client.otherSubnet = "192.168.2.0/24"
+	client.endIp = clientConfig.EndIP
+	client.endHttpPort = clientConfig.EndHttpPort
+	client.endUdpPort = clientConfig.EndUdpPort
+	client.subnet = clientConfig.Subnet
+	client.otherSubnet = clientConfig.OtherSubnet
 
-	_, err := rand.Read(client.sid[:])
+	_, err = rand.Read(client.sid[:])
 	if err != nil {
 		fmt.Println("客户端会话ID生成失败:", err)
 		return

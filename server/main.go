@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"github.com/songgao/water"
 	"github.com/songgao/water/waterutil"
@@ -101,12 +102,28 @@ func (srv Server) handler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	fmt.Println("Responder...")
 
+	// 解析配置文件。
+	var cfgFile string
+	flag.StringVar(&cfgFile, "config", "", "configFile")
+	flag.Parse()
+
+	if cfgFile == "" {
+		cfgFile = flag.Arg(0)
+	}
+
+	cfg, err := noise.ParseConfig(cfgFile)
+	serverConfig, ok := cfg.(noise.ServerConfig)
+	if err != nil || !ok {
+		fmt.Println("服务端配置文件读取出错。")
+		return
+	}
+
 	// 初始化服务端结构体。
 	server := new(Server)
-	server.ip = "22.22.22.1"
-	server.httpPort = 51820
-	server.udpPort = 51821
-	server.tunnelIP = "10.10.10.1/24"
+	server.ip = serverConfig.IP
+	server.httpPort = serverConfig.HttpPort
+	server.udpPort = serverConfig.UdpPort
+	server.tunnelIP = serverConfig.TunnelIP
 
 	server.ErPriv, server.ErPub = noise.NewKeyPair()
 	server.SrPriv, server.SrPub = noise.NewKeyPair()
