@@ -17,7 +17,7 @@ const (
 	NoiseIdentifier     = "DePlus v1 215572162@qq.com"
 
 	FLG_HSH byte = 0x10 // handshaking
-	FLG_PSH byte = 0x08 // heartbeat
+	FLG_HBT byte = 0x08 // heartbeat
 	FLG_FIN byte = 0x04 // finish
 	FLG_ACK byte = 0x02 // acknowledge
 	FLG_DAT byte = 0x00 // transport data
@@ -25,7 +25,6 @@ const (
 	STAT_INIT      int32 = iota // initing
 	STAT_HANDSHAKE              // handeshaking
 	STAT_WORKING                // working
-	STAT_FIN                    // finishing
 
 	HDR_LEN        int = 9
 	UDP_BUFFER     int = 65535

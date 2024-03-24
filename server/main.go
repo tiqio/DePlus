@@ -48,8 +48,9 @@ type Peer struct {
 
 	recvBuffer *noise.PacketBuffer
 
-	hsDone chan struct{}
-	subnet *net.IPNet
+	hsDone       chan struct{}
+	subnet       *net.IPNet
+	lastSeenTime time.Time
 }
 
 type Server struct {
@@ -164,34 +165,13 @@ func main() {
 	go server.handleUDP(serverUdpAddr)
 
 	// 将从TUN设备获得的数据包处理成客户端的数据结构，即将Packet包装为UdpPacket。
-	go func() {
-		for {
-			p := <-server.fromIface
-			dest := waterutil.IPv4Destination(p.Payload).To4()
-			fmt.Printf("===== 接收到目标地址为%s的数据包。=====\n", dest)
-			sid := noise.IP4_uint64(dest)
-
-			if peer, found := server.peers[sid]; found {
-				p.Seq = peer.Seq()
-				up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
-				server.toNet <- up
-			} else {
-				fmt.Println("没有找到隧道地址相对应的客户端。")
-				for _, peer = range server.peers {
-					if peer.subnet.Contains(dest) {
-						fmt.Println("可以在客户端通告的子网中找到目的地址，回路打通。")
-						p.Seq = peer.Seq()
-						up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
-						server.toNet <- up
-						break
-					}
-				}
-			}
-		}
-	}()
+	go server.forwardFrames()
 
 	// 处理和TUN设备相关的流量。
 	go server.handleInterface()
+
+	// 监听客户端是否超时退出。
+	go server.peerTimeoutWatcher()
 
 	termSignal := make(chan os.Signal, 1)
 	signal.Notify(termSignal, os.Interrupt, syscall.SIGTERM)
@@ -213,7 +193,7 @@ func (srv *Server) handleInterface() {
 	}()
 
 	// 从TUN设备中读取数据包并写入toNet。
-	frame := make([]byte, noise.UDP_BUFFER-noise.HDR_LEN)
+	frame := make([]byte, noise.PAYLOAD_BUFFER)
 	go func() {
 		for {
 			n, err := srv.iface.Read(frame)
@@ -412,6 +392,8 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 		noise.FLG_HSH:                 srv.handleHandshake,
 		noise.FLG_HSH | noise.FLG_ACK: srv.handleHandshakeAck,
 		noise.FLG_DAT:                 srv.handleDataPacket,
+		noise.FLG_HBT:                 srv.handleHeartbeat,
+		noise.FLG_FIN:                 srv.handleFinish,
 	}
 
 	// 将toNet队列中的UdpPacket发送到UDP数据流的对端。
@@ -458,8 +440,9 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 			fmt.Println("数据报文处理中...")
 		}
 
-		if handle_func, ok := srv.pktHandle[p.Flag]; ok {
-			handle_func(up, p, peer)
+		var handleFunc func(*noise.UdpPacket, *noise.Packet, *Peer)
+		if handleFunc, ok = srv.pktHandle[p.Flag]; ok {
+			handleFunc(up, p, peer)
 		} else {
 			fmt.Println("报文的Flag标志未被注册。")
 		}
@@ -469,6 +452,9 @@ func (srv *Server) handleUDP(serverUdpAddr string) {
 func (srv *Server) handleDataPacket(up *noise.UdpPacket, p *noise.Packet, peer *Peer) {
 	if peer.state == noise.STAT_WORKING {
 		peer.recvBuffer.Push(p)
+		peer.lastSeenTime = time.Now()
+	} else {
+		fmt.Println("当前Peer未达到可传输数据包的状态。")
 	}
 }
 
@@ -478,4 +464,92 @@ func (srv *Server) handleHandshakeAck(up *noise.UdpPacket, p *noise.Packet, peer
 	} else {
 		fmt.Println("当前Peer结构的状态不合法。")
 	}
+
+	peer.lastSeenTime = time.Now()
+}
+
+func (srv *Server) handleHeartbeat(up *noise.UdpPacket, p *noise.Packet, peer *Peer) {
+	peer.lastSeenTime = time.Now()
+}
+
+func (srv *Server) peerTimeoutWatcher() {
+	timeout := time.Second * time.Duration(60)
+	interval := time.Second * time.Duration(30)
+
+	for {
+		time.Sleep(interval)
+		for sid, peer := range srv.peers {
+			if sid < 0x01<<32 {
+				continue
+			}
+			conntime := time.Since(peer.lastSeenTime)
+			if conntime > timeout {
+				srv.kickOutPeer(sid)
+			}
+		}
+	}
+}
+
+func (srv Server) forwardFrames() {
+	for {
+		p := <-srv.fromIface
+		dest := waterutil.IPv4Destination(p.Payload).To4()
+		fmt.Printf("===== 接收到目标地址为%s的数据包。=====\n", dest)
+		sid := noise.IP4_uint64(dest)
+
+		if peer, found := srv.peers[sid]; found {
+			p.Seq = peer.Seq()
+			up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
+			srv.toNet <- up
+		} else {
+			fmt.Println("没有找到隧道地址相对应的客户端。")
+			for _, peer = range srv.peers {
+				if peer.subnet.Contains(dest) {
+					fmt.Println("可以在客户端通告的子网中找到目的地址，回路打通。")
+					p.Seq = peer.Seq()
+					up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
+					srv.toNet <- up
+					break
+				}
+			}
+		}
+	}
+}
+
+func (srv Server) kickOutPeer(sid uint64) {
+	peer, ok := srv.peers[sid]
+	if !ok {
+		fmt.Println("客户端超时，对等Peer结构不存在。")
+		return
+	}
+
+	key := noise.IP4_uint64(peer.ip)
+	srv.pool.Release(peer.ip)
+
+	out, err := noise.RunCommand(fmt.Sprintf("sudo ip route del %s dev %s", peer.subnet, srv.iface.Name()))
+	if err != nil {
+		fmt.Println("标准输出:", out)
+		fmt.Println("服务端本地删除客户端子网路由失败:", err)
+		return
+	}
+
+	delete(srv.peers, sid)
+	delete(srv.peers, key)
+}
+
+func (srv Server) handleFinish(packet *noise.UdpPacket, packet2 *noise.Packet, peer *Peer) {
+	key := noise.IP4_uint64(peer.ip)
+	srv.pool.Release(peer.ip)
+
+	out, err := noise.RunCommand(fmt.Sprintf("sudo ip route del %s dev %s", peer.subnet, srv.iface.Name()))
+	if err != nil {
+		fmt.Println("标准输出:", out)
+		fmt.Println("服务端本地删除客户端子网路由失败:", err)
+		return
+	}
+
+	delete(srv.peers, peer.sid)
+	delete(srv.peers, key)
+
+	fmt.Printf("Sid为[%d]，Addr为[%v]的Peer的资源释放完成。\n", peer.sid, peer.addr)
 }

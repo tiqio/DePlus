@@ -35,6 +35,11 @@ func (p *Pool) Next() (*net.IPNet, error) {
 	return tunnelIP, nil
 }
 
+func (p *Pool) Release(ip net.IP) {
+	i := ip[3]
+	p.pool[i] = 0
+}
+
 func IP4_uint64(ip net.IP) (i uint64) {
 	i = 0
 	for _, a := range ip {

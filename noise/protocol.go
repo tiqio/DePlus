@@ -44,6 +44,8 @@ func (p *Packet) Pack(TSend NoiseSymmetricKey) []byte {
 	case FLG_DAT:
 		// 需要利用TiSend或着TrSend对数据流进行加密。
 		buf.Write(TSend.Encrypt(p.Payload))
+	case FLG_HBT | FLG_FIN:
+		break
 	default:
 		fmt.Println("要加密的报文的Flag无法受理。")
 	}
@@ -59,7 +61,7 @@ func UnPack(b []byte) (*Packet, error) {
 	p := new(Packet)
 	buf := bytes.NewBuffer(b)
 	binary.Read(buf, binary.BigEndian, &p.Header)
-	p.Payload = make([]byte, UDP_BUFFER-HDR_LEN)
+	p.Payload = make([]byte, PAYLOAD_BUFFER)
 	buf.Read(p.Payload)
 
 	return p, nil

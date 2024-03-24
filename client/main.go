@@ -131,7 +131,9 @@ func main() {
 	fmt.Printf("正在向%s发起UDP连接...\n", serverUdpAddr)
 
 	// 处理与服务端对接的UDP数据流。
-	go client.handleUDP(serverUdpAddr)
+	udpAddr, _ := net.ResolveUDPAddr("udp", serverUdpAddr)
+	udpConn, _ := net.DialUDP("udp", nil, udpAddr)
+	go client.handleUDP(udpConn)
 
 	// 处理和TUN设备相关的流量。
 	// 必须放到handleHandshakeAck完成，TUN设备被创建后。
@@ -140,6 +142,10 @@ func main() {
 	termSignal := make(chan os.Signal, 1)
 	signal.Notify(termSignal, os.Interrupt, syscall.SIGTERM)
 	<-termSignal
+
+	// 在接收到关闭信号后，向服务端发起请求，释放相关资源。
+	client.toServer(udpConn, noise.FLG_FIN, nil)
+
 	fmt.Println("客户端关闭。")
 }
 
@@ -157,7 +163,7 @@ func (clt *Client) handleInterface() {
 	}()
 
 	// 从TUN设备中读取数据包并写入toNet。
-	frame := make([]byte, noise.UDP_BUFFER-noise.HDR_LEN)
+	frame := make([]byte, noise.PAYLOAD_BUFFER)
 	for {
 		n, err := clt.iface.Read(frame)
 		if err != nil {
@@ -175,10 +181,7 @@ func (clt *Client) handleInterface() {
 	}
 }
 
-func (clt *Client) handleUDP(serverUdpAddr string) {
-	udpAddr, _ := net.ResolveUDPAddr("udp", serverUdpAddr)
-	udpConn, _ := net.DialUDP("udp", nil, udpAddr)
-
+func (clt *Client) handleUDP(udpConn *net.UDPConn) {
 	// 注册和Flag相对应的处理函数。
 	clt.pktHandle = map[byte](func(*net.UDPConn, *noise.Packet)){
 		noise.FLG_HSH | noise.FLG_ACK: clt.handleHandshakeAck,
@@ -197,6 +200,17 @@ func (clt *Client) handleUDP(serverUdpAddr string) {
 				return
 			case <-time.After(5 * time.Second):
 				fmt.Println("握手报文超时重传...")
+			}
+		}
+	}()
+
+	// 每间隔一段时间发送心跳包。
+	go func() {
+		var intval time.Duration = time.Second * 30
+		for {
+			time.Sleep(intval)
+			if clt.state == noise.STAT_WORKING {
+				clt.heartbeat(udpConn)
 			}
 		}
 	}()
@@ -232,12 +246,16 @@ func (clt *Client) handleUDP(serverUdpAddr string) {
 			fmt.Println("数据报文处理中...")
 		}
 
-		if handle_func, ok := clt.pktHandle[p.Flag]; ok {
-			handle_func(udpConn, p)
+		if handleFunc, ok := clt.pktHandle[p.Flag]; ok {
+			handleFunc(udpConn, p)
 		} else {
 			fmt.Println("报文的Flag标志未被注册。")
 		}
 	}
+}
+
+func (clt *Client) heartbeat(u *net.UDPConn) {
+	clt.toServer(u, noise.FLG_HBT, nil)
 }
 
 func (clt *Client) handshake(u *net.UDPConn) {
