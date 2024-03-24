@@ -95,8 +95,6 @@ Noise Protocol Framework：http://noise.protocol.org/noise.pdf
 
 ![manage.png](static%2Fmanage.png)
 
-### 报文交换
-
 ### 报文交互流程
 - 握手阶段：完成密钥派生，路由添加和TUN设备启动。
   - Login：通过用户名和密码从服务端获取独立的临时公钥。
