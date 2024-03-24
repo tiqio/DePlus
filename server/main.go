@@ -48,6 +48,7 @@ type Peer struct {
 	recvBuffer *noise.PacketBuffer
 
 	hsDone chan struct{}
+	subnet *net.IPNet
 }
 
 type Server struct {
@@ -150,6 +151,7 @@ func main() {
 		for {
 			p := <-server.fromIface
 			dest := waterutil.IPv4Destination(p.Payload).To4()
+			fmt.Printf("===== 接收到目标地址为%s的数据包。=====\n", dest)
 			sid := noise.IP4_uint64(dest)
 
 			if peer, found := server.peers[sid]; found {
@@ -157,7 +159,16 @@ func main() {
 				up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
 				server.toNet <- up
 			} else {
-				fmt.Println("没有找到目标地址相对应的客户端。")
+				fmt.Println("没有找到隧道地址相对应的客户端。")
+				for _, peer = range server.peers {
+					if peer.subnet.Contains(dest) {
+						fmt.Println("可以在客户端通告的子网中找到目的地址，回路打通。")
+						p.Seq = peer.Seq()
+						up := &noise.UdpPacket{peer.addr, p.Pack(peer.TSend)}
+						server.toNet <- up
+						break
+					}
+				}
 			}
 		}
 	}()
@@ -231,6 +242,22 @@ func (srv *Server) handleHandshake(up *noise.UdpPacket, p *noise.Packet, peer *P
 	left = right
 	right += tai64n.TimestampSize + poly1305.TagSize
 	copy(peer.EncTime[:], p.Payload[left:right])
+
+	// 获取到客户端通告的子网网段。
+	left = right
+	right += 4 + 1
+	by := p.Payload[left:right]
+	ipStr := fmt.Sprintf("%d.%d.%d.%d/%d", by[0], by[1], by[2], by[3], by[4])
+	_, subnet, _ := net.ParseCIDR(ipStr)
+	peer.subnet = subnet
+
+	// 在服务端配置路由。
+	out, err := noise.RunCommand(fmt.Sprintf("sudo ip route add %s dev %s", ipStr, srv.iface.Name()))
+	if err != nil {
+		fmt.Println("标准输出:", out)
+		fmt.Println("服务端本地设置客户端子网路由失败:", err)
+		return
+	}
 
 	// 消耗接收到的Handshake Initiation并生成用于传输的Handshake Response。
 	peer.srv = srv

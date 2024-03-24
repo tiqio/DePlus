@@ -59,7 +59,9 @@ type Client struct {
 
 	handshakeDone chan struct{}
 
-	pktHandle map[byte](func(*net.UDPConn, *noise.Packet))
+	pktHandle   map[byte](func(*net.UDPConn, *noise.Packet))
+	subnet      string
+	otherSubnet string
 }
 
 func main() {
@@ -70,6 +72,9 @@ func main() {
 	client.endIp = "22.22.22.1"
 	client.endHttpPort = 51820
 	client.endUdpPort = 51821
+	client.subnet = "192.168.1.0/24"
+	client.otherSubnet = "192.168.2.0/24"
+
 	_, err := rand.Read(client.sid[:])
 	if err != nil {
 		fmt.Println("客户端会话ID生成失败:", err)
@@ -257,6 +262,14 @@ func (clt *Client) handleHandshakeAck(u *net.UDPConn, p *noise.Packet) {
 		fmt.Println("配置本地TUN设备的地址:", ip, subnet.Mask)
 		clt.iface, _ = noise.NewTun(ipStr)
 
+		// 在客户端配置路由。
+		out, err := noise.RunCommand(fmt.Sprintf("sudo ip route add %s dev %s", clt.otherSubnet, clt.iface.Name()))
+		if err != nil {
+			fmt.Println("标准输出:", out)
+			fmt.Println("客户端本地设置其他客户端子网路由失败:", err)
+			return
+		}
+
 		// 处理和TUN设备相关的流量。
 		go clt.handleInterface()
 
@@ -331,10 +344,23 @@ func (clt *Client) initiationPayload() []byte {
 	// 将EiPub，EncStatic和EncTime组装成Payload。
 	buf := bytes.NewBuffer(make([]byte, 0, noise.NoisePublicKeySize+
 		noise.NoisePublicKeySize+poly1305.TagSize+
-		tai64n.TimestampSize+poly1305.TagSize))
+		tai64n.TimestampSize+poly1305.TagSize+
+		4+1))
 	buf.Write(clt.EiPub[:])
 	buf.Write(clt.EncStatic[:])
 	buf.Write(clt.EncTime[:])
+
+	// 解析本地通告的子网。
+	_, subnet, err := net.ParseCIDR(clt.subnet)
+	if err != nil {
+		fmt.Println("通告的当地子网的格式不对:", err)
+		return nil
+	}
+	ip := subnet.IP.To4()
+	mask, _ := subnet.Mask.Size()
+
+	buf.Write(ip)
+	buf.WriteByte(byte(mask))
 
 	return buf.Bytes()
 }
